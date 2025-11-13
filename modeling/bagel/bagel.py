@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional
 
 import torch
 import torch.nn.functional as F
@@ -19,9 +19,106 @@ from data.data_utils import (
 )
 from .qwen2_navit import NaiveCache
 from .modeling_utils import MLPconnector, TimestepEmbedder, PositionEmbedding
-from modeling.cache_utils.taylorseer import cache_init
 
 from tqdm import tqdm
+
+
+class KeyValueAdapter(nn.Module):
+    """
+    Adapter for mapping key-value cache from understanding space to generation space.
+    """
+    def __init__(
+        self, 
+        num_layers: int, 
+        num_heads: int, 
+        head_dim: int,
+        num_adapter_layers: Optional[int] = None,
+    ):
+        """
+        Args:
+            num_layers: Number of transformer layers (e.g., 32)
+            num_heads: Number of key-value heads
+            head_dim: Dimension of each attention head
+            num_adapter_layers: Number of actual adapter layers to create.
+                If None, creates one adapter per layer (no sharing).
+                If < num_layers, multiple layers will share the same adapter.
+                Example: num_layers=32, num_adapter_layers=8 means every 4 layers share one adapter.
+        """
+        super().__init__()
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        
+        # 确定实际创建的adapter数量
+        if num_adapter_layers is None:
+            num_adapter_layers = num_layers
+        
+        self.num_adapter_layers = num_adapter_layers
+        
+        # 创建层到adapter的映射
+        # 例如: 32层映射到8个adapter, 则每4层共享一个adapter
+        # Layer 0-3 -> Adapter 0, Layer 4-7 -> Adapter 1, ...
+        self.layer_to_adapter_idx = [
+            (i * num_adapter_layers) // num_layers 
+            for i in range(num_layers)
+        ]
+        
+        # 为每个adapter创建独立的矩阵
+        self.key_adapters = nn.ModuleList([
+            nn.Linear(head_dim, head_dim, bias=False) 
+            for _ in range(num_adapter_layers)
+        ])
+        self.value_adapters = nn.ModuleList([
+            nn.Linear(head_dim, head_dim, bias=False)
+            for _ in range(num_adapter_layers)
+        ])
+        
+        self._init_weights()
+        
+    def _init_weights(self):
+        """Initialize adapter weights to identity mapping"""
+        for adapter_idx in range(self.num_adapter_layers):
+            # 初始化为单位矩阵，使得初始时adapter不改变输入
+            nn.init.eye_(self.key_adapters[adapter_idx].weight)
+            nn.init.eye_(self.value_adapters[adapter_idx].weight)
+    
+    def forward(self, past_key_values: NaiveCache) -> NaiveCache:
+        """
+        Transform key-value cache from understanding space to generation space.
+        
+        Args:
+            past_key_values: NaiveCache object containing keys and values for each layer
+                Each key/value has shape: (seqlens, num_heads, head_dim)
+            
+        Returns:
+            Transformed NaiveCache object with same structure
+        """
+        adapted_cache = NaiveCache(self.num_layers)
+        
+        for layer_idx in range(self.num_layers):
+            key_cache = past_key_values.key_cache[layer_idx]
+            value_cache = past_key_values.value_cache[layer_idx]
+            
+            if key_cache is None or value_cache is None:
+                # 如果该层还没有缓存，保持为None
+                continue
+            
+            # key_cache shape: (seqlens, num_heads, head_dim)
+            # value_cache shape: (seqlens, num_heads, head_dim)
+            
+            # 获取该层对应的adapter索引
+            adapter_idx = self.layer_to_adapter_idx[layer_idx]
+            
+            # 应用adapter变换
+            # 对每个head的特征维度进行线性变换
+            adapted_key = self.key_adapters[adapter_idx](key_cache)
+            adapted_value = self.value_adapters[adapter_idx](value_cache)
+            
+            # 更新缓存
+            adapted_cache.key_cache[layer_idx] = adapted_key
+            adapted_cache.value_cache[layer_idx] = adapted_value
+        
+        return adapted_cache
 
 
 class BagelConfig(PretrainedConfig):
@@ -38,6 +135,8 @@ class BagelConfig(PretrainedConfig):
         connector_act="gelu_pytorch_tanh",
         interpolate_pos=False,
         timestep_shift=1.0,
+        use_kv_adapter=False,
+        num_adapter_layers=None,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -52,6 +151,8 @@ class BagelConfig(PretrainedConfig):
         self.connector_act = connector_act
         self.interpolate_pos = interpolate_pos
         self.timestep_shift = timestep_shift
+        self.use_kv_adapter = use_kv_adapter
+        self.num_adapter_layers = num_adapter_layers
 
 
 class Bagel(PreTrainedModel):
@@ -85,6 +186,20 @@ class Bagel(PreTrainedModel):
             self.connector = MLPconnector(self.vit_hidden_size, self.hidden_size, config.connector_act)
             self.vit_pos_embed = PositionEmbedding(self.vit_max_num_patch_per_side, self.hidden_size)
 
+        # 添加KV Adapter用于从理解空间映射到生成空间
+        if config.use_kv_adapter and config.visual_gen and config.visual_und:
+            num_layers = config.llm_config.num_hidden_layers
+            num_kv_heads = config.llm_config.num_key_value_heads
+            head_dim = self.hidden_size // config.llm_config.num_attention_heads
+            self.kv_adapter = KeyValueAdapter(
+                num_layers=num_layers,
+                num_heads=num_kv_heads,
+                head_dim=head_dim,
+                num_adapter_layers=config.num_adapter_layers,
+            )
+        else:
+            self.kv_adapter = None
+
         if config.interpolate_pos:
             self.get_flattened_position_ids = get_flattened_position_ids_interpolate
         else:
@@ -97,6 +212,21 @@ class Bagel(PreTrainedModel):
         if self.config.visual_gen:
             nn.init.constant_(self.llm2vae.weight, 0)
             nn.init.constant_(self.llm2vae.bias, 0)
+    
+    def apply_kv_adapter(self, past_key_values: NaiveCache) -> NaiveCache:
+        """
+        将past_key_values从理解空间映射到生成空间。
+        
+        Args:
+            past_key_values: 从理解模式获得的KV缓存
+            
+        Returns:
+            映射后的KV缓存，适用于生成模式
+        """
+        if self.kv_adapter is not None:
+            return self.kv_adapter(past_key_values)
+        else:
+            return past_key_values
 
     def forward(
         self,
@@ -122,7 +252,7 @@ class Bagel(PreTrainedModel):
         packed_vae_token_indexes: Optional[torch.LongTensor] = None,
         packed_timesteps: Optional[torch.LongTensor] = None,
         mse_loss_indexes: Optional[torch.BoolTensor] = None,
-    ) -> torch.Tensor:
+        ) -> torch.Tensor:
         """
         Args:
             sequence_length: length of sequence.
@@ -273,9 +403,9 @@ class Bagel(PreTrainedModel):
         packed_text_indexes: torch.LongTensor,
         packed_key_value_indexes: torch.LongTensor,
         key_values_lens: torch.IntTensor,
-    ):
+        ):
         packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
-
+        print(packed_text_embedding)
         extra_inputs = {}
         if self.use_moe:
             extra_inputs = {"mode": "und"}
@@ -373,7 +503,7 @@ class Bagel(PreTrainedModel):
         packed_indexes: torch.LongTensor,
         packed_key_value_indexes: torch.LongTensor,
         key_values_lens: torch.IntTensor,
-    ):
+        ):
         packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
         packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
         packed_sequence[packed_text_indexes] = packed_text_embedding
@@ -504,7 +634,7 @@ class Bagel(PreTrainedModel):
         packed_indexes: torch.LongTensor,
         key_values_lens: torch.IntTensor,
         packed_key_value_indexes: torch.Tensor,
-    ):
+        ):
         packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
         packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
         packed_sequence[packed_text_indexes] = packed_text_embedding
@@ -674,20 +804,7 @@ class Bagel(PreTrainedModel):
         cfg_img_key_values_lens: Optional[torch.IntTensor] = None,
         cfg_img_packed_key_value_indexes: Optional[torch.LongTensor] = None,
         cfg_type: str = "parallel",
-        # cache_args
-        enable_taylorseer=False,
-    ):
-        if enable_taylorseer:
-            self.language_model.model.enable_taylorseer = True
-            model_pred_cache_dic, model_pred_current = cache_init(self, num_timesteps)
-            model_pred_text_cache_dic, model_pred_text_current = cache_init(self, num_timesteps)
-            model_pred_img_cache_dic, model_pred_img_current = cache_init(self, num_timesteps)
-        else:
-            self.language_model.model.enable_taylorseer = False
-            model_pred_cache_dic, model_pred_current = None, None
-            model_pred_text_cache_dic, model_pred_text_current = None, None
-            model_pred_img_cache_dic, model_pred_img_current = None, None
-    
+        ):
         x_t = packed_init_noises
 
         timesteps = torch.linspace(1, 0, num_timesteps, device=x_t.device)
@@ -734,21 +851,9 @@ class Bagel(PreTrainedModel):
                 cfg_img_past_key_values=cfg_img_past_key_values,
                 cfg_img_packed_key_value_indexes=cfg_img_packed_key_value_indexes,
                 cfg_type=cfg_type,
-                # cache
-                model_pred_cache_dic=model_pred_cache_dic,
-                model_pred_current=model_pred_current,
-                model_pred_text_cache_dic=model_pred_text_cache_dic,
-                model_pred_text_current=model_pred_text_current,
-                model_pred_img_cache_dic=model_pred_img_cache_dic,
-                model_pred_img_current=model_pred_img_current,
             )
 
             x_t = x_t - v_t.to(x_t.device) * dts[i] # velocity pointing from data to noise
-        
-        if enable_taylorseer:
-            del model_pred_cache_dic, model_pred_current
-            del model_pred_text_cache_dic, model_pred_text_current
-            del model_pred_img_cache_dic, model_pred_img_current
 
         unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
         return unpacked_latent
@@ -785,14 +890,8 @@ class Bagel(PreTrainedModel):
         cfg_img_past_key_values: Optional[NaiveCache] = None,
         cfg_img_packed_key_value_indexes: Optional[torch.LongTensor] = None,
         cfg_type: str = "parallel",
-        # cache
-        model_pred_cache_dic: Optional[Dict[str, Any]] = None,
-        model_pred_current: Optional[int] = None,
-        model_pred_text_cache_dic: Optional[Dict[str, Any]] = None,
-        model_pred_text_current: Optional[int] = None,
-        model_pred_img_cache_dic: Optional[Dict[str, Any]] = None,
-        model_pred_img_current: Optional[int] = None,
-    ):
+        ):
+    
         packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
         packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
         packed_sequence[packed_text_indexes] = packed_text_embedding
@@ -812,10 +911,6 @@ class Bagel(PreTrainedModel):
                 "packed_vae_token_indexes": packed_vae_token_indexes,
                 "packed_text_indexes": packed_text_indexes
             }
-        
-        if self.language_model.model.enable_taylorseer:
-            self.language_model.model.cache_dic = model_pred_cache_dic
-            self.language_model.model.current = model_pred_current
 
         output = self.language_model.forward_inference(
             packed_query_sequence=packed_sequence,
@@ -833,9 +928,6 @@ class Bagel(PreTrainedModel):
         v_t = v_t[packed_vae_token_indexes]
 
         if cfg_text_scale > 1.0:
-            if self.language_model.model.enable_taylorseer:
-                self.language_model.model.cache_dic = model_pred_text_cache_dic
-                self.language_model.model.current = model_pred_text_current
             cfg_text_output = self.language_model.forward_inference(
                 packed_query_sequence=packed_sequence,
                 query_lens=packed_seqlens,
@@ -852,9 +944,6 @@ class Bagel(PreTrainedModel):
             cfg_text_v_t = cfg_text_v_t[packed_vae_token_indexes]
 
         if cfg_img_scale > 1.0:
-            if self.language_model.model.enable_taylorseer:
-                self.language_model.model.cache_dic = model_pred_img_cache_dic
-                self.language_model.model.current = model_pred_img_current
             cfg_img_output = self.language_model.forward_inference(
                 packed_query_sequence=packed_sequence,
                 query_lens=packed_seqlens,
@@ -975,13 +1064,45 @@ class Bagel(PreTrainedModel):
             )
             past_key_values = output.past_key_values
             packed_query_sequence = output.packed_query_sequence
+            
+            # # 保存中间结果用于分析
+            # if not hasattr(self, '_generation_debug_data'):
+            #     self._generation_debug_data = {
+            #         'packed_query_sequences': [],
+            #         'pred_logits': [],
+            #         'generated_tokens': [],
+            #         'step_info': []
+            #     }
+            
+            # self._generation_debug_data['packed_query_sequences'].append(
+            #     packed_query_sequence.detach().cpu().clone()
+            # )
+            
             pred_logits = self.language_model.lm_head(packed_query_sequence)
+            self._generation_debug_data['pred_logits'].append(
+                pred_logits.detach().cpu().clone()
+            )
 
             if do_sample:
                 probs = nn.functional.softmax(pred_logits / temperature, dim=-1)
                 curr_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
             else:
                 curr_tokens = torch.argmax(pred_logits, dim=-1)
+            
+            # # 保存生成的令牌和步骤信息
+            # self._generation_debug_data['generated_tokens'].append(
+            #     curr_tokens.detach().cpu().clone()
+            # )
+            # self._generation_debug_data['step_info'].append({
+            #     'step': step,
+            #     'token_id': curr_tokens[0].item() if len(curr_tokens) > 0 else None,
+            #     'sequence_shape': packed_query_sequence.shape,
+            #     'logits_shape': pred_logits.shape,
+            #     'max_logit': pred_logits.max().item(),
+            #     'min_logit': pred_logits.min().item(),
+            #     'logits_mean': pred_logits.mean().item(),
+            #     'logits_std': pred_logits.std().item()
+            # })
 
             uppacked = list(packed_key_value_indexes.split(key_values_lens.tolist(), dim=0))
             for i in range(len(uppacked)):
@@ -1011,7 +1132,7 @@ class Bagel(PreTrainedModel):
         max_length: int,
         do_sample: bool = False,
         temperature: float = 1.0,
-    ):
+        ):
         device = next(self.parameters()).device
 
         if isinstance(new_token_ids, dict):
