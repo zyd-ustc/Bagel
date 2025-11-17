@@ -19,107 +19,8 @@ from data.data_utils import (
 )
 from .qwen2_navit import NaiveCache
 from .modeling_utils import MLPconnector, TimestepEmbedder, PositionEmbedding
-
+from .adapter import KeyValueAdapter
 from tqdm import tqdm
-
-
-class KeyValueAdapter(nn.Module):
-    """
-    Adapter for mapping key-value cache from understanding space to generation space.
-    """
-    def __init__(
-        self, 
-        num_layers: int, 
-        num_heads: int, 
-        head_dim: int,
-        num_adapter_layers: Optional[int] = None,
-    ):
-        """
-        Args:
-            num_layers: Number of transformer layers (e.g., 32)
-            num_heads: Number of key-value heads
-            head_dim: Dimension of each attention head
-            num_adapter_layers: Number of actual adapter layers to create.
-                If None, creates one adapter per layer (no sharing).
-                If < num_layers, multiple layers will share the same adapter.
-                Example: num_layers=32, num_adapter_layers=8 means every 4 layers share one adapter.
-        """
-        super().__init__()
-        self.num_layers = num_layers
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-        
-        # 确定实际创建的adapter数量
-        if num_adapter_layers is None:
-            num_adapter_layers = num_layers
-        
-        self.num_adapter_layers = num_adapter_layers
-        
-        # 创建层到adapter的映射
-        # 例如: 32层映射到8个adapter, 则每4层共享一个adapter
-        # Layer 0-3 -> Adapter 0, Layer 4-7 -> Adapter 1, ...
-        self.layer_to_adapter_idx = [
-            (i * num_adapter_layers) // num_layers 
-            for i in range(num_layers)
-        ]
-        
-        # 为每个adapter创建独立的矩阵
-        self.key_adapters = nn.ModuleList([
-            nn.Linear(head_dim, head_dim, bias=False) 
-            for _ in range(num_adapter_layers)
-        ])
-        self.value_adapters = nn.ModuleList([
-            nn.Linear(head_dim, head_dim, bias=False)
-            for _ in range(num_adapter_layers)
-        ])
-        
-        self._init_weights()
-        
-    def _init_weights(self):
-        """Initialize adapter weights to identity mapping"""
-        for adapter_idx in range(self.num_adapter_layers):
-            # 初始化为单位矩阵，使得初始时adapter不改变输入
-            nn.init.eye_(self.key_adapters[adapter_idx].weight)
-            nn.init.eye_(self.value_adapters[adapter_idx].weight)
-    
-    def forward(self, past_key_values: NaiveCache) -> NaiveCache:
-        """
-        Transform key-value cache from understanding space to generation space.
-        
-        Args:
-            past_key_values: NaiveCache object containing keys and values for each layer
-                Each key/value has shape: (seqlens, num_heads, head_dim)
-            
-        Returns:
-            Transformed NaiveCache object with same structure
-        """
-        adapted_cache = NaiveCache(self.num_layers)
-        
-        for layer_idx in range(self.num_layers):
-            key_cache = past_key_values.key_cache[layer_idx]
-            value_cache = past_key_values.value_cache[layer_idx]
-            
-            if key_cache is None or value_cache is None:
-                # 如果该层还没有缓存，保持为None
-                continue
-            
-            # key_cache shape: (seqlens, num_heads, head_dim)
-            # value_cache shape: (seqlens, num_heads, head_dim)
-            
-            # 获取该层对应的adapter索引
-            adapter_idx = self.layer_to_adapter_idx[layer_idx]
-            
-            # 应用adapter变换
-            # 对每个head的特征维度进行线性变换
-            adapted_key = self.key_adapters[adapter_idx](key_cache)
-            adapted_value = self.value_adapters[adapter_idx](value_cache)
-            
-            # 更新缓存
-            adapted_cache.key_cache[layer_idx] = adapted_key
-            adapted_cache.value_cache[layer_idx] = adapted_value
-        
-        return adapted_cache
-
 
 class BagelConfig(PretrainedConfig):
     def __init__(
@@ -138,7 +39,7 @@ class BagelConfig(PretrainedConfig):
         use_kv_adapter=False,
         num_adapter_layers=None,
         **kwargs
-    ):
+        ):
         super().__init__(**kwargs)
         self.visual_gen = visual_gen
         self.visual_und = visual_und
@@ -176,6 +77,12 @@ class Bagel(PreTrainedModel):
             self.time_embedder = TimestepEmbedder(self.hidden_size)
             self.vae2llm = nn.Linear(self.patch_latent_dim, self.hidden_size)
             self.llm2vae = nn.Linear(self.hidden_size, self.patch_latent_dim)
+            self.kv_adapter = KeyValueAdapter(
+                num_layers=config.llm_config.num_hidden_layers,
+                num_heads=config.llm_config.num_attention_heads,
+                head_dim=self.hidden_size // config.llm_config.num_attention_heads,
+                num_adapter_layers=config.num_adapter_layers,
+            )
             self.latent_pos_embed = PositionEmbedding(self.max_latent_size, self.hidden_size)
 
         if config.visual_und:
@@ -185,21 +92,6 @@ class Bagel(PreTrainedModel):
             self.vit_hidden_size = config.vit_config.hidden_size
             self.connector = MLPconnector(self.vit_hidden_size, self.hidden_size, config.connector_act)
             self.vit_pos_embed = PositionEmbedding(self.vit_max_num_patch_per_side, self.hidden_size)
-
-        # 添加KV Adapter用于从理解空间映射到生成空间
-        if config.use_kv_adapter and config.visual_gen and config.visual_und:
-            num_layers = config.llm_config.num_hidden_layers
-            num_kv_heads = config.llm_config.num_key_value_heads
-            head_dim = self.hidden_size // config.llm_config.num_attention_heads
-            self.kv_adapter = KeyValueAdapter(
-                num_layers=num_layers,
-                num_heads=num_kv_heads,
-                head_dim=head_dim,
-                num_adapter_layers=config.num_adapter_layers,
-            )
-        else:
-            self.kv_adapter = None
-
         if config.interpolate_pos:
             self.get_flattened_position_ids = get_flattened_position_ids_interpolate
         else:
@@ -228,7 +120,7 @@ class Bagel(PreTrainedModel):
         else:
             return past_key_values
 
-    def forward(
+    def forward_for_adapter(
         self,
         sequence_length: int,
         packed_text_ids: torch.LongTensor,
@@ -252,7 +144,12 @@ class Bagel(PreTrainedModel):
         packed_vae_token_indexes: Optional[torch.LongTensor] = None,
         packed_timesteps: Optional[torch.LongTensor] = None,
         mse_loss_indexes: Optional[torch.BoolTensor] = None,
-        ) -> torch.Tensor:
+        past_key_values: Optional[NaiveCache] = None,
+        packed_seqlens: Optional[torch.IntTensor] = None,
+        packed_indexes: Optional[torch.LongTensor] = None,
+        key_values_lens: Optional[torch.IntTensor] = None,
+        packed_key_value_indexes: Optional[torch.LongTensor] = None,
+    ) -> torch.Tensor:
         """
         Args:
             sequence_length: length of sequence.
@@ -293,7 +190,8 @@ class Bagel(PreTrainedModel):
         else:
             attention_mask = nested_attention_masks
 
-        if self.config.visual_und:
+        # 处理VIT tokens用于理解任务
+        if self.config.visual_und and packed_vit_tokens is not None:
             cu_seqlens = torch.nn.functional.pad(torch.cumsum(vit_token_seqlens, dim=0), (1, 0))
             cu_seqlens = cu_seqlens.to(torch.int32)
             max_seqlen = torch.max(vit_token_seqlens).item()
@@ -308,55 +206,143 @@ class Bagel(PreTrainedModel):
             packed_vit_token_embed = packed_vit_token_embed + vit_token_pos_emb
             packed_sequence[packed_vit_token_indexes] = packed_vit_token_embed
 
+        # 处理VIT tokens用于生成任务（添加噪声）
+        packed_vit_token_embed_clean = None
+        noise = None
         if self.config.visual_gen:
-            p = self.latent_patch_size
-            packed_latent = []
-            for latent, (h, w) in zip(padded_latent, patchified_vae_latent_shapes):
-                latent = latent[:, :h * p, :w * p].reshape(self.latent_channel, h, p, w, p)
-                latent = torch.einsum("chpwq->hwpqc", latent).reshape(-1, p * p * self.latent_channel)
-                packed_latent.append(latent)
-            packed_latent_clean = torch.cat(packed_latent, dim=0)
+            # 使用VIT tokens进行生成，而不是VAE latent
+            # 首先通过VIT model和connector处理，得到干净的VIT embedding
+            if packed_vit_tokens is not None and packed_vit_token_indexes is not None:
+                cu_seqlens = torch.nn.functional.pad(torch.cumsum(vit_token_seqlens, dim=0), (1, 0))
+                cu_seqlens = cu_seqlens.to(torch.int32)
+                max_seqlen = torch.max(vit_token_seqlens).item()
+                packed_vit_token_embed_clean = self.vit_model(
+                    packed_pixel_values=packed_vit_tokens, 
+                    packed_flattened_position_ids=packed_vit_position_ids,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                )
+                packed_vit_token_embed_clean = self.connector(packed_vit_token_embed_clean)
+                
+                # 添加噪声（类似VAE latent的处理方式）
+                noise = torch.randn_like(packed_vit_token_embed_clean)
+                packed_timesteps = torch.sigmoid(packed_timesteps)
+                packed_timesteps = self.timestep_shift * packed_timesteps / (1 + (self.timestep_shift - 1) * packed_timesteps)
+                packed_vit_token_embed = (1 - packed_timesteps[:, None]) * packed_vit_token_embed_clean + packed_timesteps[:, None] * noise
+                
+                # 添加时间嵌入和位置嵌入
+                packed_timestep_embeds = self.time_embedder(packed_timesteps)
+                vit_token_pos_emb = self.vit_pos_embed(packed_vit_position_ids)
+                packed_vit_token_embed = packed_vit_token_embed + packed_timestep_embeds + vit_token_pos_emb
+                
+                # 放入packed_sequence（覆盖理解任务的VIT embedding）
+                packed_sequence[packed_vit_token_indexes] = packed_vit_token_embed
 
-            noise = torch.randn_like(packed_latent_clean)
-            packed_timesteps = torch.sigmoid(packed_timesteps)
-            packed_timesteps = self.timestep_shift * packed_timesteps / (1 + (self.timestep_shift - 1) * packed_timesteps)
-            packed_latent = (1 - packed_timesteps[:, None]) * packed_latent_clean + packed_timesteps[:, None] * noise
-            packed_timestep_embeds = self.time_embedder(packed_timesteps)
-            latent_token_pos_emb = self.latent_pos_embed(packed_latent_position_ids)
-            packed_latent = self.vae2llm(packed_latent) + packed_timestep_embeds + latent_token_pos_emb
-            packed_sequence[packed_vae_token_indexes] = packed_latent
-
-        extra_inputs = {}
-        if self.use_moe:
-            packed_und_token_indexes = packed_text_indexes
-            if packed_vit_token_indexes is not None:
-                packed_und_token_indexes=torch.cat([packed_text_indexes, packed_vit_token_indexes], dim=0)
-            extra_inputs.update(
-                packed_und_token_indexes=packed_und_token_indexes,
-                packed_gen_token_indexes=packed_vae_token_indexes,
+        # 处理理解任务（使用forward_train）
+        if self.config.visual_und:
+            extra_inputs = {}
+            if self.use_moe:
+                packed_und_token_indexes = packed_text_indexes
+                if packed_vit_token_indexes is not None:
+                    packed_und_token_indexes=torch.cat([packed_text_indexes, packed_vit_token_indexes], dim=0)
+                extra_inputs.update(
+                    packed_und_token_indexes=packed_und_token_indexes,
+                )
+            
+            last_hidden_state = self.language_model(
+                packed_sequence=packed_sequence,
+                sample_lens=sample_lens,
+                attention_mask=attention_mask,
+                packed_position_ids=packed_position_ids,
+                **extra_inputs,
             )
+        else:
+            last_hidden_state = None
 
-        last_hidden_state = self.language_model(
-            packed_sequence=packed_sequence,
-            sample_lens=sample_lens,
-            attention_mask=attention_mask,
-            packed_position_ids=packed_position_ids,
-            **extra_inputs,
-        )
-
+        # 处理生成任务（使用forward_inference，参考_forward_flow）
         mse = None
-        if self.config.visual_gen:
-            packed_mse_preds = self.llm2vae(last_hidden_state[mse_loss_indexes])
-            target = noise - packed_latent_clean # NOTE: v_t=dx_t/dt=x_1-x_0, pointing from data to noise
-            has_mse = packed_timesteps > 0
-            mse = (packed_mse_preds - target[has_mse]) ** 2
+        if self.config.visual_gen and packed_vit_token_embed_clean is not None and noise is not None:
+            # 准备生成任务的packed_sequence（只包含文本和带噪声的VIT tokens）
+            if packed_seqlens is None:
+                # 如果没有提供packed_seqlens，从sequence_length计算
+                packed_seqlens = torch.tensor([sequence_length], dtype=torch.int32, device=packed_sequence.device)
+            if packed_indexes is None:
+                # 如果没有提供packed_indexes，使用所有索引
+                packed_indexes = torch.arange(sequence_length, dtype=torch.long, device=packed_sequence.device)
+            
+            # 准备文本embedding
+            packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
+            packed_sequence_gen = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
+            packed_sequence_gen[packed_text_indexes] = packed_text_embedding
+            
+            # 添加带噪声的VIT tokens（已经在前面处理过）
+            if packed_vit_token_indexes is not None:
+                # 从packed_sequence中获取带噪声的VIT embedding
+                packed_vit_token_embed_noisy = packed_sequence[packed_vit_token_indexes]
+                packed_sequence_gen[packed_vit_token_indexes] = packed_vit_token_embed_noisy
+            
+            # 准备extra_inputs
+            extra_inputs_gen = {}
+            if self.use_moe:
+                extra_inputs_gen = {
+                    "mode": "gen",
+                    "packed_vit_token_indexes": packed_vit_token_indexes,
+                    "packed_text_indexes": packed_text_indexes
+                }
+            
+            # 使用forward_inference进行生成
+            if past_key_values is not None and key_values_lens is not None and packed_key_value_indexes is not None:
+                output = self.language_model.forward_inference(
+                    packed_query_sequence=packed_sequence_gen,
+                    query_lens=packed_seqlens,
+                    packed_query_position_ids=packed_position_ids,
+                    packed_query_indexes=packed_indexes,
+                    past_key_values=past_key_values,
+                    key_values_lens=key_values_lens,
+                    packed_key_value_indexes=packed_key_value_indexes,
+                    update_past_key_values=False,
+                    is_causal=False,
+                    **extra_inputs_gen,
+                )
+                # 直接使用输出（已经在hidden_size维度，不需要llm2vae映射）
+                v_t = output.packed_query_sequence[packed_vit_token_indexes]
+                
+                # 计算MSE loss
+                target = noise - packed_vit_token_embed_clean  # NOTE: v_t=dx_t/dt=x_1-x_0, pointing from data to noise
+                has_mse = packed_timesteps > 0
+                if has_mse.any():
+                    packed_mse_preds = v_t[has_mse] if has_mse.any() else v_t
+                    mse = (packed_mse_preds - target[has_mse]) ** 2 if has_mse.any() else (packed_mse_preds - target) ** 2
+            else:
+                # 如果没有past_key_values，回退到forward_train
+                extra_inputs_gen = {}
+                if self.use_moe:
+                    extra_inputs_gen.update(
+                        packed_gen_token_indexes=packed_vit_token_indexes,
+                    )
+                
+                last_hidden_state_gen = self.language_model(
+                    packed_sequence=packed_sequence_gen,
+                    sample_lens=sample_lens,
+                    attention_mask=attention_mask,
+                    packed_position_ids=packed_position_ids,
+                    **extra_inputs_gen,
+                )
+                
+                # 计算MSE loss
+                packed_mse_preds = last_hidden_state_gen[mse_loss_indexes]
+                target = noise - packed_vit_token_embed_clean  # NOTE: v_t=dx_t/dt=x_1-x_0, pointing from data to noise
+                has_mse = packed_timesteps > 0
+                if has_mse.any():
+                    mse = (packed_mse_preds - target[has_mse]) ** 2
 
         ce = None
-        if ce_loss_indexes is not None:
+        if ce_loss_indexes is not None and last_hidden_state is not None:
             packed_ce_preds = self.language_model.lm_head(last_hidden_state[ce_loss_indexes])
             ce = F.cross_entropy(packed_ce_preds, packed_label_ids, reduction="none")
 
         return dict(mse=mse, ce=ce)
+
 
 
     def prepare_prompts(self, curr_kvlens, curr_rope, prompts, tokenizer, new_token_ids):
@@ -857,6 +843,68 @@ class Bagel(PreTrainedModel):
 
         unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
         return unpacked_latent
+
+    def _forward_flow_training(
+        self,
+        x_t: torch.Tensor,
+        timestep: torch.LongTensor,
+        packed_vae_token_indexes: torch.LongTensor,
+        packed_vae_position_ids: torch.LongTensor,
+        packed_text_ids: torch.LongTensor,
+        packed_text_indexes: torch.LongTensor,
+        packed_indexes: torch.LongTensor,
+        packed_position_ids: torch.LongTensor,
+        packed_seqlens: torch.IntTensor,
+        key_values_lens: torch.IntTensor,
+        past_key_values: NaiveCache,
+        packed_key_value_indexes: torch.LongTensor,
+        mode: str = "gen",
+        packed_vae_token_indexes_moe: Optional[torch.LongTensor] = None,
+        packed_text_indexes_moe: Optional[torch.LongTensor] = None,
+        ):
+        """
+        训练版本的 _forward_flow，允许梯度计算。
+        简化版本，不包含 CFG 逻辑。
+        """
+        packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
+        packed_sequence = packed_text_embedding.new_zeros((packed_seqlens.sum().item(), self.hidden_size))
+        packed_sequence[packed_text_indexes] = packed_text_embedding
+
+        # 处理 timestep（确保所有样本使用相同的 timestep）
+        if timestep.numel() > 1:
+            timestep = timestep[0:1]
+        
+        packed_pos_embed = self.latent_pos_embed(packed_vae_position_ids)
+        packed_timestep_embeds = self.time_embedder(timestep)
+        x_t_embed = self.vae2llm(x_t) + packed_timestep_embeds + packed_pos_embed
+        if x_t_embed.dtype != packed_sequence.dtype:
+            x_t_embed = x_t_embed.to(packed_sequence.dtype)
+        packed_sequence[packed_vae_token_indexes] = x_t_embed
+
+        extra_inputs = {}
+        if self.use_moe:
+            extra_inputs = {
+                "mode": mode,
+                "packed_vae_token_indexes": packed_vae_token_indexes_moe if packed_vae_token_indexes_moe is not None else packed_vae_token_indexes,
+                "packed_text_indexes": packed_text_indexes_moe if packed_text_indexes_moe is not None else packed_text_indexes
+            }
+
+        output = self.language_model.forward_inference(
+            packed_query_sequence=packed_sequence,
+            query_lens=packed_seqlens,
+            packed_query_position_ids=packed_position_ids,
+            packed_query_indexes=packed_indexes,
+            past_key_values=past_key_values,
+            key_values_lens=key_values_lens,
+            packed_key_value_indexes=packed_key_value_indexes,
+            update_past_key_values=False,
+            is_causal=False,
+            **extra_inputs,
+        )
+        v_t = self.llm2vae(output.packed_query_sequence)
+        v_t = v_t[packed_vae_token_indexes]
+
+        return v_t
 
     @torch.no_grad
     def _forward_flow(
