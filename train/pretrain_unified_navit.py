@@ -2,12 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
+import gc
 import os
 import wandb
 import yaml
 from copy import deepcopy
 from dataclasses import dataclass, field
 from time import time
+from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -27,8 +29,7 @@ from data.dataset_base import DataConfig, PackedDataset, collate_wrapper
 from data.data_utils import add_special_tokens
 from modeling.autoencoder import load_ae
 from modeling.bagel import (
-    BagelConfig, Bagel, Qwen2Config, Qwen2ForCausalLM, SiglipVisionConfig, SiglipVisionModel, 
-    KeyValueAdapter
+    BagelConfig, Bagel, Qwen2Config, Qwen2ForCausalLM, SiglipVisionConfig, SiglipVisionModel
 )
 from modeling.qwen2 import Qwen2Tokenizer
 from train.train_utils import create_logger, get_latest_ckpt
@@ -36,9 +37,63 @@ from train.fsdp_utils import (
     FSDPCheckpoint, FSDPConfig, grad_checkpoint_check_fn, fsdp_wrapper, 
     fsdp_ema_setup, fsdp_ema_update,
 )
-from inferencer import InterleaveInferencer
-from data.transforms import ImageTransform
-from modeling.bagel.qwen2_navit import NaiveCache
+
+
+def count_parameters(module: torch.nn.Module) -> int:
+    return sum(p.numel() for p in module.parameters())
+
+
+def qwen2_flop_coefficients(config) -> tuple[float, float]:
+    hidden_size = config.hidden_size
+    vocab_size = config.vocab_size
+    num_hidden_layers = config.num_hidden_layers
+    num_key_value_heads = config.num_key_value_heads
+    num_attention_heads = config.num_attention_heads
+    intermediate_size = config.intermediate_size
+    head_dim = getattr(config, "head_dim", hidden_size // num_attention_heads)
+
+    q_size = num_attention_heads * head_dim
+    k_size = num_key_value_heads * head_dim
+    v_size = num_key_value_heads * head_dim
+
+    mlp_N = hidden_size * intermediate_size * 3
+    attn_linear_N = hidden_size * (q_size + k_size + v_size + num_attention_heads * head_dim)
+    emd_and_lm_head_N = vocab_size * hidden_size * 2
+    dense_N = (mlp_N + attn_linear_N) * num_hidden_layers + emd_and_lm_head_N
+    dense_token_factor = 6.0 * dense_N
+    attn_factor = 12.0 * head_dim * num_attention_heads * num_hidden_layers
+    return dense_token_factor, attn_factor
+
+
+def detect_peak_tflops(default_tflops: float) -> float:
+    """Guess per-device BF16 TFLOPs from GPU name; fall back to default when unknown."""
+    try:
+        import torch
+        device_name = torch.cuda.get_device_name()
+    except (ImportError, RuntimeError):
+        return default_tflops
+
+    name = device_name.upper()
+    if "MI300X" in name:
+        tflops = 1336.0
+    elif any(tag in name for tag in ("H100", "H800", "H200")):
+        tflops = 989.0
+    elif any(tag in name for tag in ("A100", "A800")):
+        tflops = 312.0
+    elif "L40" in name:
+        tflops = 181.05
+    elif "L20" in name:
+        tflops = 119.5
+    elif "H20" in name:
+        tflops = 148.0
+    elif "910B" in name:
+        tflops = 354.0
+    elif "RTX 3070 TI" in name:
+        tflops = 21.75
+    else:
+        tflops = default_tflops
+    return tflops
+
 
 @dataclass
 class ModelArguments:
@@ -268,7 +323,7 @@ class TrainingArguments:
         default=0.9999,
         metadata={"help": "Decay rate for the exponential moving average of model weights."}
     )
-    max_grad_norm: int = field(
+    max_grad_norm: float = field(
         default=1.0,
         metadata={"help": "Gradient clipping threshold (L2 norm)."}
     )
@@ -291,6 +346,14 @@ class TrainingArguments:
     expected_num_tokens: int = field(
         default=32768,
         metadata={"help": "Soft target token count; yield the batch once it reaches or exceeds this size."}
+    )
+    gradient_accumulation_steps: int = field(
+        default=1,
+        metadata={"help": "Number of updates steps to accumulate before performing a backward/update pass."}
+    )
+    peak_device_tflops: float = field(
+        default=0.0,
+        metadata={"help": "Per-GPU peak BF16 TFLOPs used to compute MFU; leave at 0 to auto-detect."}
     )
 
     # --- distributed training / FSDP ---
@@ -349,6 +412,10 @@ def main():
     torch.cuda.set_device(device)
     parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    if training_args.peak_device_tflops <= 0:
+        auto_tflops = detect_peak_tflops(training_args.peak_device_tflops)
+        if auto_tflops > 0:
+            training_args.peak_device_tflops = auto_tflops
 
     # Setup logging:
     if dist.get_rank() == 0:
@@ -360,11 +427,16 @@ def main():
             id=f"{training_args.wandb_name}-run{training_args.wandb_runid}", 
             name=training_args.wandb_name, 
             resume=training_args.wandb_resume,
-            mode="offline" if training_args.wandb_offline else "online"
+            mode="offline" if training_args.wandb_offline else "online",
+            settings=wandb.Settings(init_timeout=120)
         )
         wandb.config.update(training_args)
         wandb.config.update(model_args)
         wandb.config.update(data_args)
+        if training_args.peak_device_tflops > 0:
+            logger.info(f"Using peak_device_tflops={training_args.peak_device_tflops:.2f} TFLOPs (per GPU).")
+        else:
+            logger.warning("Peak device TFLOPs not set or auto-detected; MFU will report 0.")
     else:
         logger = create_logger(None, dist.get_rank())
     dist.barrier()
@@ -453,6 +525,10 @@ def main():
     if training_args.visual_und:
         model.vit_model.vision_model.embeddings.convert_conv2d_to_linear(vit_config)
 
+    total_param_count = count_parameters(model)
+    lm_param_count = count_parameters(model.language_model)
+    logger.info(f"Model parameter count: {total_param_count / 1e9:.2f}B (LM-only: {lm_param_count / 1e9:.2f}B)")
+
     # Setup tokenizer for model:
     tokenizer = Qwen2Tokenizer.from_pretrained(model_args.model_path if training_args.finetune_from_hf else model_args.llm_path)
     tokenizer, new_token_ids, num_new_tokens = add_special_tokens(tokenizer)
@@ -473,8 +549,7 @@ def main():
         model.vit_model.eval()
         for param in model.vit_model.parameters():
             param.requires_grad = False
-    vae_transform = ImageTransform(1024, 512, 16)
-    vit_transform = ImageTransform(980, 224, 14)
+
     # Setup FSDP and load pretrained model:
     fsdp_config = FSDPConfig(
         sharding_strategy=training_args.sharding_strategy,
@@ -496,12 +571,7 @@ def main():
         ), 
         check_fn=grad_checkpoint_check_fn
     )
-    adapter = KeyValueAdapter(
-        num_layers=llm_config.num_hidden_layers,
-        num_heads=llm_config.num_attention_heads,
-        head_dim=llm_config.hidden_size // llm_config.num_attention_heads,
-        num_adapter_layers=8,
-    )
+
     if dist.get_rank() == 0:
         print(fsdp_model)
         for name, param in model.named_parameters():
@@ -583,88 +653,59 @@ def main():
     if training_args.visual_gen:
         vae_model.to(device).eval()
     fsdp_model.train()
-    adapter.train()
     ema_model.eval()
-    ema_inferencer = InterleaveInferencer(
-        model=ema_model,
-        vae_model=vae_model,
-        tokenizer=tokenizer,
-        adapter= adapter,
-        vae_transform=vae_transform,
-        vit_transform=vit_transform,
-        new_token_ids=new_token_ids,
-        adapter=adapter,
-    )
 
     # train loop
     start_time = time()
     logger.info(f"Training for {training_args.total_steps} steps, starting at {train_step}...")
-    
-    ANALYSIS_PROMPT = "What is the color of the sky?"
-    GENERATION_PROMPT = "Generate an image of a sky with a sunset."
-    for curr_step, data in enumerate(train_loader, start=train_step):
-        # 先将data移到GPU并转换为dict
+    optimizer.zero_grad()
+    total_norm = torch.tensor(0.0, device=device)
+    token_window = 0.0
+    seqlen_square_window = 0.0
+    dense_token_factor, attn_factor = qwen2_flop_coefficients(model.language_model.config)
+    for micro_step, data in enumerate(train_loader):
+        curr_step = train_step + micro_step // training_args.gradient_accumulation_steps
+        if curr_step >= training_args.total_steps:
+            logger.info(f"Reached total_steps={training_args.total_steps}, stopping training.")
+            break
         data = data.cuda(device).to_dict()
         data_indexes = data.pop('batch_data_indexes', None)
-        ce_loss_weights = data.pop('ce_loss_weights', None)
-        
-        #准备生成图片的上下文：生成指令+图ViT编码
-        context = ema_inferencer.init_gen_context()
-        context = ema_inferencer.update_context_text(GENERATION_PROMPT, context)
-        context = ema_inferencer.update_context_image(data['padded_images'], context, vae=False, vit=True)
+        ce_loss_weights = data.pop('ce_loss_weights', None)       
+        tokens_tensor = torch.tensor(float(data['sequence_length']), device=device)
+        dist.all_reduce(tokens_tensor, op=dist.ReduceOp.SUM)
+        token_window += tokens_tensor.item()
+        if data['sample_lens']:
+            sample_lens_tensor = torch.tensor(data['sample_lens'], dtype=torch.float32, device=device)
+            sample_square = torch.dot(sample_lens_tensor, sample_lens_tensor)
+            dist.all_reduce(sample_square, op=dist.ReduceOp.SUM)
+            seqlen_square_window += sample_square.item()
 
-        #准备图片理解的上下文
-        context = ema_inferencer.update_context_text(ANALYSIS_PROMPT, context)
-        _, context = ema_inferencer.gen_text(
-                    gen_context=context,
-                    max_length=100,
-                )
-        
-        # 通过adapter将理解空间的past_key_values转换到生成空间
-        adapted_past_key_values = fsdp_model.apply_kv_adapter(context['past_key_values'])
-        
-        # 准备forward_for_adapter需要的参数
-        # 从context中提取kv_lens
-        kv_lens = context['kv_lens']
-        key_values_lens = torch.tensor(kv_lens, dtype=torch.int32, device=device)
-        
-        # 构建packed_key_value_indexes（从0到sum(kv_lens)-1）
-        total_kv_len = sum(kv_lens)
-        packed_key_value_indexes = torch.arange(total_kv_len, dtype=torch.long, device=device)
-        
-        # 准备packed_seqlens和packed_indexes（从data中获取或计算）
-        sequence_length = data.get('sequence_length', sum(data.get('sample_lens', [])))
-        if 'sample_lens' in data:
-            packed_seqlens = torch.tensor(data['sample_lens'], dtype=torch.int32, device=device)
-        else:
-            packed_seqlens = torch.tensor([sequence_length], dtype=torch.int32, device=device)
-        
-        if 'packed_text_indexes' in data:
-            # 如果有packed_text_indexes，计算packed_indexes
-            packed_indexes = torch.arange(sequence_length, dtype=torch.long, device=device)
-        else:
-            packed_indexes = torch.arange(sequence_length, dtype=torch.long, device=device)
-        
-        # 将adapted_past_key_values和其他参数添加到data中
-        data['past_key_values'] = adapted_past_key_values
-        data['key_values_lens'] = key_values_lens
-        data['packed_key_value_indexes'] = packed_key_value_indexes
-        data['packed_seqlens'] = packed_seqlens
-        data['packed_indexes'] = packed_indexes
-        
         with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
-            # 注意：不再需要VAE latent，因为使用VIT
-            # 如果data中有padded_images，保留它用于VIT处理
-            if 'padded_images' in data and training_args.visual_gen:
-                # 移除padded_latent相关的内容，因为使用VIT
-                data.pop('padded_latent', None)
-                data.pop('patchified_vae_latent_shapes', None)
-                data.pop('packed_latent_position_ids', None)
-                data.pop('packed_vae_token_indexes', None)
-            
-            # 使用forward_for_adapter方法
-            loss_dict = fsdp_model.forward_for_adapter(**data)
+            if training_args.visual_gen:
+                with torch.no_grad():
+                    data['padded_latent'] = vae_model.encode(data.pop('padded_images'))
+            try:
+                past_key_values = None
+                if training_args.visual_und and 'packed_vit_tokens' in data:
+                    analysis_prompt = "Describe this image"
+                    analysis_prompt_ids = tokenizer.encode(analysis_prompt)
+                    analysis_prompt_ids = [new_token_ids['bos_token_id']] + analysis_prompt_ids + [new_token_ids['eos_token_id']]
+                    
+                    with torch.no_grad():
+                        past_key_values = fsdp_model(
+                            generate_analysis_cache=True,
+                            analysis_prompt_ids=analysis_prompt_ids,
+                            new_token_ids=new_token_ids,
+                            **data
+                        )
 
+                loss_dict = fsdp_model(past_key_values=past_key_values, **data)
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    logger.error(f"CUDA OOM at step {curr_step}: {e}")
+                    torch.cuda.empty_cache()
+                raise e
+        
         loss = 0
         ce = loss_dict["ce"]
         if ce is not None:
@@ -696,13 +737,16 @@ def main():
             loss_dict["mse"] = torch.tensor(0, device=device)
             total_mse_tokens = torch.tensor(0, device=device)
 
-        optimizer.zero_grad()
+        loss = loss / training_args.gradient_accumulation_steps
         loss.backward()
-        total_norm = fsdp_model.clip_grad_norm_(training_args.max_grad_norm)
-        optimizer.step()
-        scheduler.step()
-        fsdp_ema_update(ema_model, fsdp_model, decay=training_args.ema)
 
+        if (micro_step + 1) % training_args.gradient_accumulation_steps == 0:
+            total_norm = fsdp_model.clip_grad_norm_(training_args.max_grad_norm)
+            optimizer.step()
+            scheduler.step()
+            fsdp_ema_update(ema_model, fsdp_model, decay=training_args.ema)
+            optimizer.zero_grad()
+        
         # Log loss values:
         if curr_step % training_args.log_every == 0:
             total_samples = torch.tensor(len(data['sample_lens']), device=device)
@@ -711,7 +755,14 @@ def main():
             # Measure training speed:
             torch.cuda.synchronize()
             end_time = time()
-            steps_per_sec = training_args.log_every / (end_time - start_time)
+            elapsed = max(end_time - start_time, 1e-6)
+            steps_per_sec = training_args.log_every / elapsed
+            tokens_per_sec = token_window / elapsed
+            tokens_per_step = token_window / training_args.log_every
+            flops_all_token = dense_token_factor * token_window + attn_factor * seqlen_square_window
+            actual_tflops = flops_all_token / elapsed / 1e12
+            peak_total_tflops = training_args.peak_device_tflops * dist.get_world_size()
+            mfu_value = actual_tflops / peak_total_tflops if peak_total_tflops > 0 else 0.0
             message = f"(step={curr_step:07d}) "
             wandb_log = {}
             for key, value in loss_dict.items():
@@ -721,14 +772,20 @@ def main():
                 avg_loss = avg_loss.item() / dist.get_world_size()
                 message += f"Train Loss {key}: {avg_loss:.4f}, "
                 wandb_log[key] = avg_loss
-            message += f"Train Steps/Sec: {steps_per_sec:.2f}, "
+            message += f"Train Steps/Sec: {steps_per_sec:.2f}, Tokens/Sec: {tokens_per_sec/1000:.2f}k, MFU: {mfu_value*100:.1f}%, "
             logger.info(message)
+            if dist.get_rank() == 0:
+                print(message, flush=True)
 
             wandb_log['lr'] = optimizer.param_groups[0]['lr']
             wandb_log['total_mse_tokens'] = total_mse_tokens.item()
             wandb_log['total_ce_tokens'] = total_ce_tokens.item()
             wandb_log['total_norm'] = total_norm.item()
             wandb_log['total_samples'] = total_samples.item()
+            wandb_log['tokens_per_sec'] = tokens_per_sec
+            wandb_log['tokens_per_step'] = tokens_per_step
+            wandb_log['actual_tflops'] = actual_tflops
+            wandb_log['mfu'] = mfu_value
 
             mem_allocated = torch.tensor(torch.cuda.max_memory_allocated() / 1024**2, device=device)
             dist.all_reduce(mem_allocated, op=dist.ReduceOp.MAX)
@@ -740,6 +797,8 @@ def main():
             if dist.get_rank() == 0:
                 wandb.log(wandb_log, step=curr_step)
             start_time = time()
+            token_window = 0.0
+            seqlen_square_window = 0.0
 
         if data_status is None:
             data_status = {}
@@ -749,11 +808,18 @@ def main():
             data_status[item['dataset_name']][item['worker_id']] = item['data_indexes']
 
         if curr_step > 0 and curr_step % training_args.save_every == 0:
+            # Clear caches and ensure all CUDA operations complete before checkpoint
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
             if dist.get_rank() == 0:
                 gather_list = [None] * dist.get_world_size()
             else:
                 gather_list = None
-            dist.gather_object(data_status, gather_list, dst=0)
+            try:
+                dist.gather_object(data_status, gather_list, dst=0)
+            except RuntimeError as e:
+                logger.error(f"Error during gather_object at step {curr_step}: {e}")
+                gather_list = None if dist.get_rank() != 0 else [data_status] * dist.get_world_size()
 
             FSDPCheckpoint.fsdp_save_ckpt(
                 ckpt_dir=training_args.checkpoint_dir, 
@@ -766,7 +832,54 @@ def main():
                 fsdp_config=fsdp_config,
                 data_status=gather_list
             )
+            # Clear CUDA cache and force garbage collection after checkpoint to free memory
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
+            # comment out as an alternative to save the ema model in pt format
+            # ema_state_dict = {}
+            # for name, param in ema_model.named_parameters():
+            #     ema_state_dict[name] = param.detach().cpu()
+            
+            # torch.save(
+            #     ema_state_dict, 
+            #     os.path.join(training_args.checkpoint_dir, f"{curr_step:07d}", "ema_standard.pt")
+            # )
+    
+    # Save final checkpoint if not already saved
+    if curr_step > 0:
+        logger.info(f"Saving final checkpoint at step {curr_step}...")
+        # Clear caches and ensure all CUDA operations complete before final checkpoint
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        if dist.get_rank() == 0:
+            gather_list = [None] * dist.get_world_size()
+        else:
+            gather_list = None
+        try:
+            dist.gather_object(data_status, gather_list, dst=0)
+        except RuntimeError as e:
+            logger.error(f"Error during final gather_object: {e}")
+            gather_list = None if dist.get_rank() != 0 else [data_status] * dist.get_world_size()
+        
+        FSDPCheckpoint.fsdp_save_ckpt(
+            ckpt_dir=training_args.checkpoint_dir, 
+            train_steps=curr_step, 
+            model=fsdp_model, 
+            ema_model=ema_model, 
+            optimizer=optimizer, 
+            scheduler=scheduler, 
+            logger=logger,
+            fsdp_config=fsdp_config,
+            data_status=gather_list
+        )
+        # Clear CUDA cache and force garbage collection after final checkpoint
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        logger.info(f"Final checkpoint saved at step {curr_step}")
+    
     logger.info("Done!")
     if dist.get_rank() == 0:
         wandb.finish()
