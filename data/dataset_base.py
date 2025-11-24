@@ -396,6 +396,8 @@ class PackedDataset(torch.utils.data.IterableDataset):
 
             elif item['type'] == 'vae_image':
                 image_tensor = image_tensor_list.pop(0)
+                #把vae部分mask掉。训练t2i时，vae部分不参与训练。
+                image_tensor = torch.zeros_like(image_tensor)
                 if item['enable_cfg'] == 1 and random.random() < self.data_config.vae_cond_dropout_prob:
                     # FIXME fix vae dropout in video2video setting.
                     curr_rope_id += 1
