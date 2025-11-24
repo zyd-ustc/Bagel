@@ -689,7 +689,9 @@ def main():
                 if training_args.visual_und and 'packed_vit_tokens' in data:
                     analysis_prompt = "Describe this image"
                     analysis_prompt_ids = tokenizer.encode(analysis_prompt)
-                    analysis_prompt_ids = [new_token_ids['bos_token_id']] + analysis_prompt_ids + [new_token_ids['eos_token_id']]
+                    # Prepend original prompt (packed_text_ids)
+                    original_prompt_ids = data['packed_text_ids'].tolist()
+                    analysis_prompt_ids = original_prompt_ids + analysis_prompt_ids + [new_token_ids['eos_token_id']]
                     
                     with torch.no_grad():
                         past_key_values = fsdp_model(
