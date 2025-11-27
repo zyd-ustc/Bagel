@@ -17,7 +17,7 @@ Image.MAX_IMAGE_PIXELS = 20_000_000
 class T2IIterableDataset(DistributedIterableDataset):
     def __init__(
         self, dataset_name, transform, tokenizer, data_dir_list, num_used_data, 
-        local_rank=0, world_size=1, num_workers=8, data_status=None,
+        local_rank=0, world_size=1, num_workers=8, data_status=None, vit_transform=None,
     ):
         """
         data_dir_list: list of data directories contains parquet files
@@ -25,6 +25,7 @@ class T2IIterableDataset(DistributedIterableDataset):
         """
         super().__init__(dataset_name, local_rank, world_size, num_workers)
         self.transform = transform
+        self.vit_transform = vit_transform
         self.tokenizer = tokenizer
         self.data_status = data_status
         self.data_paths = self.get_data_paths(data_dir_list, num_used_data)
@@ -66,30 +67,44 @@ class T2IIterableDataset(DistributedIterableDataset):
                         for row_idx, row in df.iterrows():
                             num_tokens = 0
                             try:
-                                image_byte = row['image']
-                                image = pil_img2rgb(Image.open(io.BytesIO(image_byte)))
+                                # Load ground truth image (for VAE)
+                                gt_image_byte = row['ground_truth_image']
+                                gt_image = pil_img2rgb(Image.open(io.BytesIO(gt_image_byte)))
+                                vae_image_tensor = self.transform(gt_image)
+                                
+                                # Load generated image (for ViT/Understanding)
+                                gen_image_byte = row['generated_image']
+                                gen_image = pil_img2rgb(Image.open(io.BytesIO(gen_image_byte)))
+                                vit_image_tensor = self.vit_transform(gen_image)
+
                             except Exception as e:
                                 print(f'Error: {e} in rg#{row_group_id}, {parquet_file_path}')
                                 continue
-                            image_tensor = self.transform(image)
-                            height, width = image_tensor.shape[1:]
+                            
+                            # Calculate tokens for VAE image
+                            height, width = vae_image_tensor.shape[1:]
                             num_tokens += width * height // transform_stride ** 2
-
+                            
+                            # Calculate tokens for ViT image (approximate, actual calculation in PackedDataset)
+                            # Assuming standard patch size for token count estimation if needed, 
+                            # but PackedDataset handles it. We just need to ensure max_num_tokens check works.
+                            # For now, adding a rough estimate or relying on PackedDataset to handle overflow.
+                            # Let's add ViT tokens to num_tokens estimate.
+                            # Assuming 14x14 patch size and 224x224 image -> 256 tokens.
+                            # Better to use the actual vit_transform size if available, but for now just add a safe buffer or 0.
+                            # The PackedDataset will check actual length.
+                            
                             try:
-                                caption_dict = row['captions']
-                                caption_dict = json.loads(caption_dict)
+                                prompt = row['prompt']
                             except Exception as e:
                                 print(f'Error: {e} in rg#{row_group_id}, {parquet_file_path}')
                                 continue
 
-                            caps_token = [self.tokenizer.encode(v) for _, v in caption_dict.items()]
-                            if len(caps_token) == 0:
-                                print(f'no caption in rg#{row_group_id}, {parquet_file_path}')
-                                caption_token = self.tokenizer.encode(' ')
-                            else:
-                                caption_token = random.choice(caps_token)
-
-                            sequence_plan, text_ids_list = [], []
+                            caption_token = self.tokenizer.encode(prompt)
+                            
+                            sequence_plan, text_ids_list, image_tensor_list = [], [], []
+                            
+                            # 1. Text (Prompt)
                             text_ids = caption_token
                             num_tokens += len(caption_token)
                             text_ids_list.append(text_ids)
@@ -100,7 +115,19 @@ class T2IIterableDataset(DistributedIterableDataset):
                                 'special_token_loss': 0,
                                 'special_token_label': None,
                             })
-                        
+
+                            # 2. ViT Image (Generated Image) - for understanding/past_key_values
+                            image_tensor_list.append(vit_image_tensor)
+                            sequence_plan.append({
+                                'type': 'vit_image',
+                                'enable_cfg': 1, # or 0? Usually we want to condition on it.
+                                'loss': 0,
+                                'special_token_loss': 0,
+                                'special_token_label': None,
+                            })
+
+                            # 3. VAE Image (Ground Truth) - for generation target
+                            image_tensor_list.append(vae_image_tensor)
                             sequence_plan.append({
                                 'type': 'vae_image',
                                 'enable_cfg': 0,
@@ -110,7 +137,7 @@ class T2IIterableDataset(DistributedIterableDataset):
                             })
 
                             sample = dict(
-                                image_tensor_list=[image_tensor], 
+                                image_tensor_list=image_tensor_list, 
                                 text_ids_list=text_ids_list,
                                 num_tokens=num_tokens,
                                 sequence_plan=sequence_plan,
